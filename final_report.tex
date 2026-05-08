@@ -1,0 +1,220 @@
+\documentclass[11pt]{article}
+
+\usepackage{acl}
+\usepackage{url}
+
+\usepackage{times}
+\usepackage{latexsym}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+\title{Visual Science QA with DoRA Fine-Tuning, Question-Conditioned Captions, and Multi-Prompt Test-Time Augmentation}
+
+\author{
+Ryan Fleishman \\
+New York University \\
+\texttt{rmf9265@nyu.edu}
+\And
+Bram Simonnet \\
+New York University \\
+\texttt{bs4486@nyu.edu}
+}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+We present our approach to the ScienceQA Visual Multiple-Choice Challenge, a competition requiring a SmolVLM-500M-Instruct model to predict correct answer indices for science questions combining images with textual context, constrained to at most 5 million trainable parameters on free-tier compute. We fine-tune the model using Weight-Decomposed Low-Rank Adaptation (DoRA) applied to five transformer module groups---attention projections and MLP gate, up, and down projections---yielding 4.64M trainable parameters. To bridge the visual and textual modalities, we generate question-conditioned image captions from the base model before training and prepend them to every prompt. At inference time, we average next-token logit scores across three prompt phrasings and seven test-time augmentation passes per example. Our best model achieves 0.75 validation accuracy and approximately 0.74 public leaderboard accuracy, representing a substantial improvement over a na\"{i}ve LoRA baseline (0.47 accuracy) that suffered from insufficient parameter coverage, lower image resolution, and inference bugs.
+\end{abstract}
+
+\section{Introduction}
+
+Multimodal science question answering requires a model to jointly interpret visual inputs---diagrams, charts, maps, scientific illustrations---and textual context spanning questions, answer choices, and optional lecture or hint passages. The ScienceQA dataset captures this challenge across K--12 science curricula, with examples requiring everything from reading graph axes to identifying anatomical structures.
+
+The competition setting imposed strict constraints that shaped every design decision. The base model was fixed to SmolVLM-500M-Instruct, a compact 500M-parameter vision-language model. Trainable parameters were capped at 5 million, prohibiting full fine-tuning. No external data was allowed. Evaluation ran offline. Compute was limited to free-tier Google Colab and Kaggle notebook environments. These constraints made each architectural choice consequential: a poor decision on which modules to adapt or what image resolution to use directly costs accuracy with no opportunity to compensate through scale.
+
+We iterated through several system configurations and identified the key factors driving performance: (1) using DoRA instead of standard LoRA for stronger gradient signal at the same rank; (2) adapting MLP layers in addition to attention to maximize parameter utility; (3) including question-conditioned image captions as supplementary text context; (4) using labels masking to focus training loss on the answer decision; (5) scoring choices via next-token logits rather than full log-probability continuation; and (6) averaging predictions over multiple prompt phrasings and test-time augmentation passes to reduce variance.
+
+Our final model was trained on an NVIDIA A100 GPU and achieves a public leaderboard score of approximately 0.74 accuracy. We additionally report results from our own LoRA-based T4 model (0.47 accuracy) and provide a detailed analysis of the factors responsible for the 27-point gap.
+
+\section{Dataset}
+
+The competition dataset is a multimodal science question-answering collection in which each example combines an image with textual context and multiple-choice options. Each example consists of: an image (diagram, chart, photograph, or map); a question; 2--5 labeled answer choices; and optional \textit{hint} and \textit{lecture} fields providing relevant factual context. Examples also include pedagogical metadata (subject, topic, grade, category, skill). The task is to predict the 0-indexed correct choice.
+
+The provided splits contain 3,109 training examples, 1,048 validation examples, and 1,008 test examples. The number of choices varies across examples: 272 test questions have 2 choices, 438 have 3, 260 have 4, and 38 have 5. Predictions must be valid indices for each question's specific choice count. Evaluation is by classification accuracy.
+
+A key challenge is the multimodal nature of the reasoning required. Many questions cannot be answered from text alone---the answer depends on reading a value from a graph, identifying an object in a photograph, or interpreting a spatial diagram. Conversely, many questions involve scientific concepts where the lecture or hint text is the primary informative signal. A strong system must integrate both modalities effectively.
+
+We used the dataset as provided, with no filtering or augmentation of the training labels. The primary preprocessing step was generating and caching question-conditioned image captions (described in Section~\ref{sec:captions}).
+
+\section{Experimentation}
+
+\subsection{Base Model and Hardware}
+
+SmolVLM-500M-Instruct (HuggingFaceTB) is a 500M-parameter instruction-tuned vision-language model based on the Idefics3 architecture. It combines a SigLIP vision encoder with a SmolLM2 language model backbone. The model is instruction-tuned with a specific chat template that must be respected at both training and inference time; deviation from this format degrades performance.
+
+Our final model was trained on an NVIDIA A100-SXM4-40GB GPU, allowing the base model to be loaded in bfloat16 (full precision) without quantization, with a memory footprint of approximately 1.04 GB. This contrasts with our earlier T4-based experiments, which required 4-bit NF4 quantization via BitsAndBytesConfig to fit the model in the available 15 GB VRAM. TF32 was enabled for A100 throughput. Images were processed at longest-edge 1280 pixels.
+
+\subsection{DoRA Adapter Configuration}
+
+We apply Weight-Decomposed Low-Rank Adaptation (DoRA; \citealt{liu2024dora}) to five transformer module groups in the language model backbone, excluding the vision tower:
+
+\begin{verbatim}
+LoraConfig(
+    r=10,
+    lora_alpha=20,
+    lora_dropout=0.05,
+    use_dora=True,
+    target_modules=[
+        "q_proj", "v_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],
+    task_type="CAUSAL_LM",
+    exclude_modules=r".*vision_model.*",
+)
+\end{verbatim}
+
+This yields 4,638,720 trainable parameters (4.64M), leaving 361,280 headroom under the 5M competition cap. Compared to standard LoRA, DoRA decomposes each weight matrix into magnitude and direction components, updating both. Empirically, DoRA achieves better performance than LoRA at equal rank \cite{liu2024dora}, which is especially valuable under a tight parameter budget.
+
+Including the MLP projections (\texttt{gate\_proj}, \texttt{up\_proj}, \texttt{down\_proj}) alongside the attention projections (\texttt{q\_proj}, \texttt{v\_proj}) maximizes parameter utilization relative to the 5M cap. Our earlier baseline used LoRA on only four attention modules (\texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}) at rank 16, consuming far fewer of the available parameters.
+
+\subsection{Question-Conditioned Image Captions}
+\label{sec:captions}
+
+A central component of our approach is augmenting every prompt with a question-conditioned image caption. Before training, the base SmolVLM model (without any adapters) is used to generate a 1--2 sentence description of each image, conditioned on the associated question using the prompt: \textit{``Looking at this image, describe in 1--2 factual sentences the visual elements (text labels, axes, numbers, objects, colors, shapes) most relevant to answering: `\{question\}'.''} These captions are generated for all training, validation, and test examples and cached to a JSON file. At training and inference time, each prompt is prefixed with \texttt{Image description: [caption]}. This effectively provides the language model backbone with a textual surrogate for the image content, supplementing the direct visual encoding from the SigLIP encoder.
+
+This approach is motivated by the observation that instruction-tuned language models have strong priors for text-based reasoning. By rendering visual content as text, we allow the language model to apply its full contextual reasoning capacity to the visual information, improving performance on questions where fine-grained visual details---axis labels, numerical values, diagram annotations---are the critical signal.
+
+\subsection{Prompt Format and Labels Masking}
+
+Each training and inference prompt is constructed using the model's native chat template via \texttt{processor.apply\_chat\_template}. The user turn contains, in order: the image token, the question-conditioned caption, subject/topic/grade metadata, any available lecture or hint context, the question, and lettered choices (A, B, C, \ldots).
+
+Three prompt variants are used, differing in the answer prefix phrase (``Answer:'', ``The correct answer is:'', ``Therefore the correct option letter is:'') and choices header (``Choices'' vs.\ ``Options''). During training, one variant is sampled randomly per example. The answer is a single letter (A, B, C, D, or E) rather than the full choice text.
+
+Critically, only the answer letter token contributes to the training loss. All prompt tokens are masked with label \texttt{-100} in the collation step. This focuses the gradient signal on the classification decision rather than on prompt reconstruction, which involves hundreds of tokens and would otherwise dilute the learning signal.
+
+\subsection{Training Procedure}
+
+We train for 6 epochs using AdamW with a learning rate of $10^{-4}$, weight decay 0.01, cosine learning rate schedule with 8\% linear warmup, and gradient clipping at 1.0. A per-device batch size of 2 with gradient accumulation over 8 steps yields an effective batch size of 16. Gradient checkpointing is enabled to reduce memory usage. Each training image is randomly augmented with ColorJitter (brightness and contrast $\pm 10\%$, saturation $\pm 5\%$) and RandomAffine ($\pm 2^\circ$ rotation, $\pm 2\%$ translation, 97--103\% scale), matching the distribution applied at test time. Training uses mixed precision bfloat16 and completed in approximately 127.5 minutes on the A100. Validation accuracy was monitored throughout, and the best checkpoint was retained for inference.
+
+\subsection{Inference: Next-Token Logit Scoring}
+
+For each test question, we score each candidate answer letter via the next-token logit at the final prompt position. Given a prompt ending with the answer prefix token, the model produces logits over the vocabulary at that position. We read the logits corresponding to the letter token IDs (A=49, B=50, C=51, D=52, E=53) and select the letter with the highest logit as the prediction:
+
+\begin{verbatim}
+last_pos = attention_mask.sum(dim=1) - 1
+logits = model_output.logits[
+    range(batch_size), last_pos
+]
+scores = logits[:, LETTER_TOKEN_IDS[:n_choices]]
+prediction = scores.argmax(dim=-1)
+\end{verbatim}
+
+This single-pass scoring is computationally efficient---one forward pass per prompt regardless of the number of choices---and is well-aligned with how instruction-tuned models generate answers, since the next token after the answer prefix is the letter.
+
+\subsection{Multi-Prompt and Test-Time Augmentation}
+
+Each test question is evaluated under all 3 prompt variants $\times$ 7 image augmentation passes = 21 total forward passes. For the first pass of each variant the original image is used; for passes 2--7, the same ColorJitter and RandomAffine transformations as during training are applied. Log-softmax probabilities are averaged across all 21 combinations and the letter with the highest average is selected as the final prediction.
+
+This variance-reduction strategy reduces sensitivity to any single image orientation or prompt phrasing by averaging over multiple stochastic perturbations of the same question.
+
+\subsection{Calibration}
+
+We estimated a per-letter bias vector on the validation set and experimented with subtracting it from the test logits before taking the argmax. In our runs, calibration did not improve validation accuracy (0.7405 uncalibrated vs.\ 0.7328 calibrated), so test predictions use raw averaged log-softmax scores.
+
+\section{Results}
+
+\subsection{Quantitative Results}
+
+Table~\ref{tab:results} summarizes the main results across our experimental configurations.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Configuration} & \textbf{Val Acc} & \textbf{Public LB} \\
+\midrule
+No fine-tuning (generative) & $\sim$0.35 & --- \\
+Our model: LoRA r=8, 2 epochs (T4) & $\sim$0.47 & $\sim$0.47 \\
+Our model: LoRA r=16, 3 epochs (T4) & $\sim$0.47 & --- \\
+DoRA, 6 epochs + captions (A100) & 0.7500 & $\sim$0.74 \\
+\bottomrule
+\end{tabular}
+\caption{Validation and public leaderboard accuracy across configurations. ``Our model'' refers to LoRA fine-tuning on a T4 GPU with 4-bit quantization. The final submitted system is DoRA + captions on A100.}
+\label{tab:results}
+\end{table}
+
+Validation accuracy during training of the final model improved consistently across epochs, reaching 0.6584 at the end of epoch 1, 0.7032 at the end of epoch 2, and 0.7405 at the end of epoch 4. The best checkpoint was recorded at step 1122 (epoch 6) with a validation accuracy of 0.7500. The model continued improving through all six epochs, indicating that additional training would likely yield further gains within the competition constraints.
+
+\subsection{Ablation Analysis}
+
+\paragraph{LoRA vs.\ DoRA.}
+Our final system uses DoRA rather than standard LoRA. DoRA's magnitude-direction decomposition provides a richer gradient signal for updating pretrained weights, an advantage that is amplified when the parameter budget is tight. The DoRA paper \cite{liu2024dora} reports consistent gains over LoRA at matched rank.
+
+\paragraph{Module Coverage.}
+Including MLP gate, up, and down projections alongside attention projections substantially increased the effective parameter coverage relative to our T4 baseline. Our T4-based LoRA targeted only four attention modules (\texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}), using far fewer than the 5M allowed parameters. Distributing adaptation across five module groups---including feed-forward layers---better utilizes the available budget.
+
+\paragraph{Question-Conditioned Captions.}
+Captions provide the language model backbone with a textual description of the relevant visual content before it must reason over answer choices. Many ScienceQA questions require reading fine-grained visual details (axis labels, numerical values, diagram annotations) that benefit from an explicit textual surrogate when the image resolution or encoder capacity is a bottleneck.
+
+\paragraph{Labels Masking.}
+Masking prompt tokens from the training loss directs gradient signal to the answer token. Without masking, the model distributes capacity across hundreds of prompt tokens, diluting the signal for the answer classification task. This is analogous to standard practice in instruction-tuning, where only the assistant's response contributes to loss.
+
+\paragraph{Multi-Prompt TTA.}
+Averaging log-softmax probabilities across 21 combinations (3 prompt variants $\times$ 7 augmentation passes) reduces sensitivity to any single image orientation or prompt phrasing. Individual predictions carry noise from the stochastic augmentation and prompt framing; averaging over diverse framings of the same question produces a more stable aggregate score.
+
+\paragraph{Image Resolution.}
+Training at longest-edge 1280px versus our T4 baseline's 224px was a critical factor. At 224px, fine text in diagrams---axis labels, table entries, diagram annotations---becomes illegible. The higher resolution allows the SigLIP encoder to extract the fine-grained visual features necessary for many ScienceQA questions.
+
+\subsection{Discussion}
+
+The 27-point accuracy gap between our T4 LoRA model (0.47) and the final DoRA model (0.74) reflects compounding deficiencies rather than a single root cause. Our T4 model suffered from: (1) 4-bit NF4 quantization introducing weight approximation error; (2) 224px image resolution losing fine visual detail; (3) LoRA on only 4 attention modules rather than 5 diverse module groups; (4) missing labels masking; (5) only 3 training epochs; and (6) logprob continuation inference requiring $N$ forward passes and being sensitive to a correct prompt\_len calculation.
+
+A subtle but important bug in our initial logprob scoring was computing prompt length by tokenizing the text without the image, then using that length as the boundary between prompt and answer tokens. The image tokens substantially expand the sequence length (SmolVLM encodes images as a large block of visual tokens), so the text-only prompt length was systematically short. This caused the log-probability calculation to read scores from the wrong positions, degrading inference quality even when the model weights were reasonable.
+
+Post-processing experiments on the final model's predictions revealed a position bias: 37\% of 5-choice test predictions were answer index 4 (the last choice), compared to a training distribution of approximately 15\%. This last-choice bias is a known pattern in language models and suggests that further calibration or position-debiasing could yield additional improvements.
+
+\section{Conclusion}
+
+We presented a DoRA-based fine-tuning system for visual multiple-choice science question answering, incorporating question-conditioned image captioning, labels masking, multi-prompt inference, and test-time augmentation. Our final model achieves 0.75 validation accuracy and approximately 0.74 public leaderboard accuracy under the competition's strict 5M parameter cap.
+
+The project surfaced several lessons relevant to fine-tuning instruction-tuned VLMs under compute constraints.
+
+\subsection{What Worked Well}
+
+DoRA's magnitude-direction decomposition is reported to outperform standard LoRA at equal rank \cite{liu2024dora}, making it a well-motivated choice given the fixed parameter budget. Question-conditioned captions proved effective at bridging the visual-textual gap, particularly for questions requiring reading fine text from diagrams or charts. Multi-prompt averaging with TTA provided consistent variance reduction at the cost of additional inference time. Labels masking focused training directly on the answer decision, maximally using the available gradient signal.
+
+Critically, using the model's native chat template for all prompts and aligning the answer format to a single letter were foundational correctness requirements. Deviating from these---as our initial experiments did---produces a systematic mismatch between training and inference distributions that degrades performance regardless of other optimizations.
+
+\subsection{Limitations}
+
+Compute constraints were the primary limitation. Our best results required an A100 GPU and 127 minutes of training time, which is not reproducible on Kaggle/Colab free-tier T4 GPUs without quantization compromises. The 5M parameter cap also limits the rank and module coverage that can be used simultaneously; with a higher cap, expanding both rank and coverage would likely yield further gains. Additionally, our post-processing analysis identified a residual last-choice bias that calibration alone did not fully correct.
+
+\subsection{Future Work}
+
+Several directions are promising for further improvement. First, train--val joint fine-tuning for the final submission uses all labeled data (4,157 examples) rather than reserving 1,048 for validation. Second, caption quality could be improved by using a larger captioning model or more targeted prompts for specific question types (graph reading vs.\ object identification). Third, multi-seed ensembling---averaging predictions from models trained with different random seeds---would reduce variance further. Fourth, subject-stratified calibration could correct the last-choice bias more precisely than a single global bias vector.
+
+\section{Code and Reproducibility}
+
+All code used for training and inference is available in the Kaggle competition notebooks submitted with this project. The training notebook includes fixed random seeds and logs validation accuracy at each epoch checkpoint. The inference notebook reproduces the multi-prompt TTA scoring from the saved best checkpoint. All data used is the competition-provided dataset with no external augmentation.
+
+\bibliographystyle{acl_natbib}
+\begin{thebibliography}{2}
+
+\bibitem{liu2024dora}
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-Ting Cheng, and Min-Hung Chen.
+\newblock DoRA: Weight-decomposed low-rank adaptation.
+\newblock In \textit{ICML}, 2024.
+
+\bibitem{hu2022lora}
+Edward J.\ Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+\newblock LoRA: Low-rank adaptation of large language models.
+\newblock In \textit{ICLR}, 2022.
+
+\end{thebibliography}
+
+\end{document}
