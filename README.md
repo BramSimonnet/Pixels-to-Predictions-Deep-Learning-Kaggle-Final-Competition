@@ -45,6 +45,8 @@ Instead of using free-form generation, our inference pipeline directly scores va
     ├── adapter_config.json
     ├── adapter_model.safetensors
     └── README_weights.md
+```
+
 ## Files
 
 ### `final_report.pdf`
@@ -55,12 +57,12 @@ Final written report describing the dataset, methodology, training setup, infere
 
 Main notebook used for:
 
-* Loading and preprocessing the competition data
-* Generating question-conditioned image captions
-* Fine-tuning SmolVLM with DoRA
-* Evaluating on the validation split
-* Running multi-prompt inference and test-time augmentation
-* Generating the final Kaggle `submission.csv`
+- Loading and preprocessing the competition data
+- Generating question-conditioned image captions
+- Fine-tuning SmolVLM with DoRA
+- Evaluating on the validation split
+- Running multi-prompt inference and test-time augmentation
+- Generating the final Kaggle `submission.csv`
 
 ### `notebooks/final_notebook.pdf`
 
@@ -91,55 +93,55 @@ These are the trained adapter weights and adapter configuration. They are loaded
 
 ## Model Details
 
-| Component                 | Value                                                   |
-| ------------------------- | ------------------------------------------------------- |
-| Base model                | `HuggingFaceTB/SmolVLM-500M-Instruct`                   |
-| Base parameters           | 507.5M                                                  |
-| Fine-tuning method        | DoRA / LoRA via PEFT                                    |
-| LoRA rank                 | 10                                                      |
-| LoRA alpha                | 20                                                      |
-| LoRA dropout              | 0.05                                                    |
-| Target modules            | `q_proj`, `v_proj`, `gate_proj`, `up_proj`, `down_proj` |
-| Trainable parameters      | 4,638,720                                               |
-| Trainable-parameter limit | 5,000,000                                               |
+| Component | Value |
+|---|---|
+| Base model | `HuggingFaceTB/SmolVLM-500M-Instruct` |
+| Base parameters | 507.5M |
+| Fine-tuning method | DoRA / LoRA via PEFT |
+| LoRA rank | 10 |
+| LoRA alpha | 20 |
+| LoRA dropout | 0.05 |
+| Target modules | `q_proj`, `v_proj`, `gate_proj`, `up_proj`, `down_proj` |
+| Trainable parameters | 4,638,720 |
+| Trainable-parameter limit | 5,000,000 |
 
 ## Training Setup
 
-| Hyperparameter        |      Value |
-| --------------------- | ---------: |
-| Epochs                |          6 |
-| Batch size            |          2 |
-| Gradient accumulation |          8 |
-| Effective batch size  |         16 |
-| Learning rate         |     `1e-4` |
-| Weight decay          |       0.01 |
-| Warmup ratio          |       0.08 |
-| Max gradient norm     |        1.0 |
-| Precision             | `bfloat16` |
-| Image longest edge    |       1280 |
-| Seed                  |         42 |
+| Hyperparameter | Value |
+|---|---:|
+| Epochs | 6 |
+| Batch size | 2 |
+| Gradient accumulation | 8 |
+| Effective batch size | 16 |
+| Learning rate | `1e-4` |
+| Weight decay | 0.01 |
+| Warmup ratio | 0.08 |
+| Max gradient norm | 1.0 |
+| Precision | `bfloat16` |
+| Image longest edge | 1280 |
+| Seed | 42 |
 
 ## Inference Setup
 
-| Component                     | Setting                          |
-| ----------------------------- | -------------------------------- |
-| Prediction method             | Next-token answer-letter scoring |
-| Prompt variants               | 3                                |
-| Test-time augmentation passes | 5                                |
-| Inference batch size          | 4                                |
-| Captioning                    | Question-conditioned             |
-| Image splitting               | Disabled                         |
-| Output format                 | 0-indexed integer answer         |
+| Component | Setting |
+|---|---|
+| Prediction method | Next-token answer-letter scoring |
+| Prompt variants | 3 |
+| Test-time augmentation passes | 5 |
+| Inference batch size | 4 |
+| Captioning | Question-conditioned |
+| Image splitting | Disabled |
+| Output format | 0-indexed integer answer |
 
 ## Dataset
 
 The competition dataset contains multimodal science multiple-choice examples.
 
-| Split      | Number of Examples |
-| ---------- | -----------------: |
-| Train      |              3,109 |
-| Validation |              1,048 |
-| Test       |              1,008 |
+| Split | Number of Examples |
+|---|---:|
+| Train | 3,109 |
+| Validation | 1,048 |
+| Test | 1,008 |
 
 Each example includes an image, a question, multiple answer choices, and optional metadata such as subject, topic, grade, category, and skill.
 
@@ -210,13 +212,10 @@ test_logprobs.pkl
 
 ## Authors
 
-Ryan Fleishman
-New York University
+Ryan Fleishman  
+New York University  
 `rmf9265@nyu.edu`
 
-Bram Simonnet
-New York University
+Bram Simonnet  
+New York University  
 `bs4486@nyu.edu`
-
-```
-```
