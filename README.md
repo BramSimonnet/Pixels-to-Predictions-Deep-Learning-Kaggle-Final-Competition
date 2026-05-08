@@ -1,4 +1,3 @@
-````markdown
 # Pixels to Predictions: Deep Learning Kaggle Final Competition
 
 This repository contains our final project for the **Pixels to Predictions: DL Vision Challenge**, a Kaggle competition for multimodal science multiple-choice question answering.
@@ -46,8 +45,6 @@ Instead of using free-form generation, our inference pipeline directly scores va
     ├── adapter_config.json
     ├── adapter_model.safetensors
     └── README_weights.md
-````
-
 ## Files
 
 ### `final_report.pdf`
