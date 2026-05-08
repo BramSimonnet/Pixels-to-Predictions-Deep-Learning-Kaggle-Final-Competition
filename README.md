@@ -51,6 +51,7 @@ Instead of using free-form generation, our inference pipeline directly scores va
     ├── adapter_config.json
     ├── adapter_model.safetensors
     └── README_weights.md
+```
 
 ## Files
 
