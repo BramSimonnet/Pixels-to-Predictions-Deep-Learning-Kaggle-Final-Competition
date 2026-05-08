@@ -36,6 +36,12 @@ Instead of using free-form generation, our inference pipeline directly scores va
 .
 ├── README.md
 ├── final_report.pdf
+├── data/
+│   ├── README_data.md
+│   ├── train.csv
+│   ├── val.csv
+│   ├── test.csv
+│   └── sample_submission.csv
 ├── notebooks/
 │   ├── final_notebook.ipynb
 │   └── final_notebook.pdf
@@ -45,7 +51,6 @@ Instead of using free-form generation, our inference pipeline directly scores va
     ├── adapter_config.json
     ├── adapter_model.safetensors
     └── README_weights.md
-```
 
 ## Files
 
